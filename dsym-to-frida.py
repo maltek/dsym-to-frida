@@ -3,6 +3,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import fnmatch
+import io
 import os
 import re
 import sys
@@ -49,7 +50,7 @@ be verified in all specified modules.
     return parser
 
 
-def sanitize_name(type):
+def sanitize_name(type, combined=False):
     name = type.name
     # remove template parameters. don't generate handlers for more than one instantiation!
     while "<" in name:
@@ -66,7 +67,10 @@ def sanitize_name(type):
 
     # namespaces
     name = name.split("::")
-    return ".".join(name[:-1]), name[-1]
+    if combined:
+        return ".".join(name)
+    else:
+        return ".".join(name[:-1]), name[-1]
 
 def camel_case(name):
     # keep all-caps constants as-is
@@ -82,110 +86,175 @@ def camel_case(name):
     return pre + "".join(elems)
 
 
-def print_type(target, type, generated_types):
-    #print('/*%s*/' % type)
-    namespace, san_name = sanitize_name(type)
-    if namespace:
-        print("namespace %s {" % namespace)
+out = io.StringIO()
+cmp_out = io.StringIO()
+indent = 0
+def write(what):
+    global indent
+    for line in what.split("\n"):
+        if what in ('}', '};'):
+            indent -= 1
+        out.write(indent * 4 * ' ')
+        out.write(what)
+        out.write("\n")
+        if not what.startswith('//'):
+            cmp_out.write(what)
+            cmp_out.write('\n')
+        if what and what[-1] == '{':
+            indent += 1
 
-    print("    // " + type.name)
 
-    if type.GetTypeClass() == lldb.eTypeClassEnumeration:
-        print('    export const %s = {' % san_name)
-        members = type.GetEnumMembers()
-        members = [members.GetTypeEnumMemberAtIndex(i) for i in range(members.GetSize())]
-        for member in members:
-            print('''        "{0}": {1},
-        "{1}": "{0}",'''.format(member.name, member.unsigned))
-        print("        sizeof: {}".format(type.size))
-        print('    };')
-        if namespace:
-            print("}")
-        return
-
-    print('    export class %s {' % san_name)
-    print('        constructor(_ptr) { this._ptr = _ptr; }')
-
+def print_members(target, type, base_offset, mangled_syms):
+    deps = set()
     members = type.members
     if type.IsPolymorphicClass() and (not members or members[0].byte_offset == target.GetAddressByteSize()):
         ptr_size = target.GetAddressByteSize()
-        print('       0 <%3u> __vtbl_ptr_type * _vptr;' % ptr_size)
+        write('get _vtable() { return this._ptr.add(%u).readPointer(); }')
 
-    for member_idx, member in enumerate(members):
+    for base in type.bases:
+        deps.add(base.type)
+        write("// inherited from " + base.type.name)
+        deps |= print_members(target, base.type, base.byte_offset + base_offset, mangled_syms)
+
+    assert not type.vbases, "virtual base classes not implemented"
+
+    if type.bases and type.fields:
+        write("// own fields")
+
+    for member in type.fields:
         member_type_class = member.type.GetCanonicalType().GetTypeClass()
         is_class_or_struct = member_type_class in (lldb.eTypeClassStruct, lldb.eTypeClassClass)
         is_primitive = member_type_class in (lldb.eTypeClassBuiltin, lldb.eTypeClassEnumeration)
 
         if is_primitive:
             signed = 'U' if member.type.name.startswith('unsigned ') else 'S'
-            bit_mask = 1**member.bitfield_bit_size-1
+            bit_mask = 2**member.bitfield_bit_size-1
             if member.type.size <= 4:
-                fmt = '        get %s() { return (Memory.read%c%u(this._ptr.add(%u)) >>> %u)%s; }'
+                fmt = 'get %s() { return (this._ptr.add(%u).read%c%u()%s)%s; }'
+                offset = (' >>> %u' if signed == 'U' else ' >> %u') % (member.bit_offset % 8)
                 bit_mask = ' & ' + hex(bit_mask) if bit_mask else ''
             else:
-                fmt = '        get %s() { return Memory.read%c%u(this._ptr.add(%u)).shr(%u)%s; }'
+                fmt = 'get %s() { return this._ptr.add(%u).read%c%u()%s%s; }'
+                offset = '.shr(%u)' % (member.bit_offset % 8)
                 bit_mask = '.and(' + hex(bit_mask) + ')' if bit_mask else ''
+            if member.bit_offset % 8 == 0:
+                offset = ''
             type_bit_size = member.type.size * 8
-            print(fmt % (camel_case(member.name), signed, type_bit_size, member.byte_offset,
-                         member.bit_offset % 8, bit_mask))
+            write(fmt % (camel_case(member.name), member.byte_offset + base_offset, signed, type_bit_size,
+                         offset, bit_mask))
             if member.bit_offset % 8 == 0 and member.bitfield_bit_size == 0:
-                fmt = '        set %s(val) { Memory.write%c%u(this._ptr.add(%u), val); }'
-                print(fmt % (camel_case(member.name), signed, type_bit_size, member.byte_offset))
+                fmt = 'set %s(val) { this._ptr.add(%u).write%c%u(val); }'
+                write(fmt % (camel_case(member.name), member.byte_offset + base_offset, signed, type_bit_size))
+            else:
+                write('set %s(val) {' % camel_case(member.name))
+                write('let old, my;')
+                def gen_bit_field_write(byte_off, bit_off, bit_size):
+                    bit_mask = (2**bit_size - 1) << bit_off
+                    bit_mask = hex(bit_mask)
+
+                    write('old = this._ptr.add({0}).readU{1}().and(uint{1}("-1").xor("{2}"));'.format(byte_off, type_bit_size, bit_mask))
+                    if type_bit_size > 52:
+                        write('my = uint64(val.toString()).shl({0}).and("{1}");'.format(bit_off, bit_mask))
+                    else:
+                        write('my = (val << {0}) & {1};'.format(bit_off, bit_mask))
+                    write('this._ptr.add({0}).writeU{1}(old.or(my));'.format(byte_off, type_bit_size))
+                if type_bit_size < member.bit_offset + member.bitfield_bit_size:
+                    gen_bit_field_write(member.byte_offset + base_offset, member.bit_offset, type_bit_size - member.bit_offset)
+                    gen_bit_field_write(member.byte_offset + base_offset + member.type_size, 0, member.bit_offset + member.bitfield_bit_size - type_bit_size)
+                else:
+                    gen_bit_field_write(member.byte_offset + base_offset, member.bit_offset, member.bitfield_bit_size)
+                write('}')
         elif is_class_or_struct:
-            fmt = '        get %s() { return new %s(this._ptr.add(%u)); }'
-            print(fmt % (camel_case(member.name), ".".join(sanitize_name(member.type)), member.byte_offset))
+            deps.add(member.type)
+            fmt = 'get %s() { return new %s(this._ptr.add(%u)); }'
+            write(fmt % (camel_case(member.name), sanitize_name(member.type, True), member.byte_offset + base_offset))
         elif member.type.is_pointer or member.type.is_reference:
             pointee = member.type.GetPointeeType()
-            if pointee.name in generated_types:
-                type_fn = 'new {}'.format(pointee.name)
-                from_high_level = 'val instanceof {} ? val._ptr : val instanceof NativePointer ? val : throw new Error("got value of wrong type")'.format(pointee.name)
-            else:
+            if pointee.is_pointer or pointee.is_reference:
                 type_fn = ''
                 from_high_level = 'val'
-            fmt = '''        get {0}() {{
-            return {2}(Memory.readPointer(this._ptr.add({1})));
-        }}
-        set {0}(val) {{
-            Memory.writePointer(this._ptr.add({1}), {3});
-        }}'''
-            print(fmt.format(camel_case(member.name), member.byte_offset, type_fn, from_high_level))
-    print('    }')
-    print('    %s.sizeof = %u;' % (sanitize_name(type)[1], type.size))
-    if namespace:
-        print("}")
-    print()
+            else:
+                deps.add(pointee)
+                type_fn = 'new {}'.format(sanitize_name(pointee.name, True))
+                from_high_level = 'val instanceof {} ? val._ptr : val instanceof NativePointer ? val : throw new Error("got value of wrong type")'.format(sanitize_name(pointee.name, True))
+            write('get {0}() {{'.format(camel_case(member.name)))
+            write('return {1}(this._ptr.add({0}).readPointer());'.format(member.byte_offset + base_offset, type_fn))
+            wrte('}')
+            write('set %s(val) {' % camel_case(member.name))
+            write('this._ptr.add({0}).writePointer({1});'.format(member.byte_offset + base_offset, from_high_level))
+            write('}')
 
-
-def main():
-    parser = create_types_options()
-
-    options, args = parser.parse_args(sys.argv[1:])
-
-    for path in args:
-        debugger = lldb.SBDebugger.Create()
-        error = lldb.SBError()
-        target = debugger.CreateTarget(str(path), str(options.arch), str(options.platform), True, error)
-        if error.Fail():
-            print(error.description)
+    for i in range(type.GetNumberOfMemberFunctions()):
+        func = type.GetMemberFunctionAtIndex(i)
+        if func.GetKind() in (lldb.eMemberFunctionKindConstructor,
+                              lldb.eMemberFunctionKindDestructor,
+                              lldb.eMemberFunctionKindUnknown):
             continue
-        target.AddModule('/Users/malte/Library/Developer/Xcode/DerivedData/SwiftFridaTests-fdzgqlqfpbydbcbaswxptmrprxwe/Build/Products/Debug-iphoneos/SwiftFridaTests.app/Frameworks/libswiftCore.dylib', 'ios-remote', None, '/Users/malte/Library/Developer/Toolchains/swift-LOCAL-2019-06-23-a.xctoolchain//usr/lib/swift/iphoneos/libswiftCore.dylib.dSYM')
+        fn_name = func.GetName()
+        if fn_name.startswith("operator"):
+            continue
 
-        matched_types = {}
-        for module in target.modules:
-            print('module: %s' % (module.file))
-            types = module.GetTypes(lldb.eTypeClassClass | lldb.eTypeClassStruct | lldb.eTypeClassEnumeration)
-            for type in types:
-                if fnmatch.fnmatchcase(type.name, str(options.type_glob or '*')):
-                    assert type.name not in matched_types
-                    matched_types[type.name] = type
+        # GetMangledName() returns a superfluous \x01 as first byte
+        mangled = func.GetMangledName().lstrip('\x01')
 
-        for type in matched_types.values():
-            print_type(target, type, matched_types.keys())
+        # we won't have private symbols in production
+        if mangled not in mangled_syms or not mangled_syms[mangled].external:
+            continue
+
+        ret = sanitize_name(func.GetReturnType(), True)
+        args = (("arg%d: any" % i) for i in range(func.GetNumberOfArguments()))
+        write('%s(%s): %s {' % (func.GetName(), ", ".join(args), ret))
+
+        arg_names = [("arg%d" % i) for i in range(func.GetNumberOfArguments())]
+        if func.GetKind() == lldb.eMemberFunctionKindInstanceMethod:
+            arg_names = ["this._ptr.add(%d)" % base_offset] + arg_names
+        write('return _callFunction("%s", %s);' % (mangled, ", ".join(arg_names)))
+
+        write('}')
+
+    return deps
+
+
+def print_type(target, type, mangled_syms):
+    write("// " + type.name)
+
+    namespace, san_name = sanitize_name(type)
+    if namespace:
+        write("namespace %s {" % namespace)
+
+    if type.GetTypeClass() == lldb.eTypeClassEnumeration:
+        write('export const %s = {' % san_name)
+        members = type.GetEnumMembers()
+        members = [members.GetTypeEnumMemberAtIndex(i) for i in range(members.GetSize())]
+        for member in members:
+            write('"{0}": {1},'.format(member.name, member.unsigned))
+            write('"{1}": "{0}",'.format(member.name, member.unsigned))
+        write("sizeof: {}".format(type.size))
+        write('};')
+        if namespace:
+            write("}")
+        return
+
+    write('export class %s {' % san_name)
+    write('constructor(_ptr) { this._ptr = _ptr; }')
+    deps = print_members(target, type, 0, mangled_syms)
+
+    write('}')
+    write('%s.sizeof = %u;' % (san_name, type.size))
+    if namespace:
+        write("}")
+    write("")
+
+    return deps
 
 def find_matches(command):
     args = shlex.split(command) or ['*']
     found = {}
+    mangled_syms = {}
     for module in lldb.debugger.GetSelectedTarget().modules:
+        for sym in module.symbols:
+            if sym.mangled:
+                mangled_syms[sym.mangled] = sym
         types = module.GetTypes()
         for type in types:
             while type.is_pointer or type.is_reference:
@@ -203,23 +272,37 @@ def find_matches(command):
                 if fnmatch.fnmatchcase(name, glob):
                     found[name] = type
                     break
-    return found
+    return found, mangled_syms
 
 
 def list_types(debugger, command, result, dict):
-    for name in find_matches(command).keys():
+    for name in find_matches(command)[0].keys():
         print(name)
 
 def dump_type(debugger, command, result, dict):
-    generated = find_matches(command)
-    for type in generated.values():
-        print_type(lldb.target, type, generated.keys())
+    global cmp_out, out
+    generated, mangled_syms = find_matches(command)
+
+    already_printed = {}
+
+    want_output = set(generated.values())
+    have_output = set()
+    while want_output:
+        type = want_output.pop()
+        name = sanitize_name(type, True)
+        have_output.add(type)
+        want_output |= print_type(lldb.target, type, mangled_syms) - have_output
+        if name in already_printed:
+            if already_printed[name] != cmp_out.getvalue():
+                raise Exception("error: multiple types with same mapped TS name but different memory layout!")
+        else:
+            print(out.getvalue())
+            already_printed[name] = cmp_out.getvalue()
+        out = io.StringIO()
+        cmp_out = io.StringIO()
 
 def __lldb_init_module(debugger, internal_dict):
     for cmd in ['list_types', 'dump_type']:
         res = lldb.SBCommandReturnObject()
         debugger.GetCommandInterpreter().HandleCommand(b'command script add -f {0}.{1} {1}'.format(__name__, cmd), res, False)
         assert res.Succeeded()
-
-if __name__ == '__main__':
-    main()
